@@ -54,6 +54,14 @@ _Avoid_: due date (reserved for periodic work)
 The relative delivery order of messages within one queue. Higher priority is delivered first; equal priority preserves creation order.
 _Avoid_: urgency
 
+**Ready time**:
+The moment a message becomes deliverable, equal to its visibility time. Priority aging measures a message's wait from its ready time, so a message scheduled for the future does not age until it arrives.
+_Avoid_: enqueue time (a delayed message may wait a long time before it is ready)
+
+**Priority aging**:
+A starvation guarantee: a due message that has been ready for at least a configured minimum wait is delivered ahead of higher-priority messages that have not waited as long. Promoted candidates are ordered by ready time, then stable identity.
+_Avoid_: boost, escalation (aging is a fairness floor, not a priority change)
+
 **Dedupe key**:
 An application-provided identity used to suppress repeated enqueue requests for the same queue during the configured deduplication window.
 _Avoid_: idempotency key (deduplication suppresses enqueues; handler idempotency is the application's responsibility)

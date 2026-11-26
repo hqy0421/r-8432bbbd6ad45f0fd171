@@ -15,6 +15,11 @@ and releases follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Priority aging (`Options.PriorityAging`) bounds low-priority starvation: a
+  due message that has been ready for `MinWait` is delivered ahead of
+  later-arriving higher-priority work. Memory, SQLite, and PostgreSQL apply the
+  same rule, and Memory and SQLite share a controllable clock for deterministic
+  ordering. Disabled by default.
 - Release automation for server binaries and the container image.
 
 ## [0.1.6] - 2026-08-18

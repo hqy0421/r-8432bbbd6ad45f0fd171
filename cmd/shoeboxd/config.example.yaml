@@ -17,6 +17,15 @@ storage:
   dsn: ""                  # postgres only, e.g. "host=localhost port=5432 dbname=shoebox user=postgres password=secret sslmode=disable"
   schema: "public"         # postgres only; created automatically if absent
 
+# Priority aging prevents low-priority starvation. When enabled, a due message
+# that has been ready for at least min_wait is delivered ahead of higher-
+# priority messages that arrived later but have not waited as long. Messages
+# whose scheduled time has not arrived never participate. Disabled keeps the
+# existing priority-first order.
+priority_aging:
+  enabled: false
+  min_wait: 10m
+
 # Per-queue webhook targets. A queue listed here is push-delivered by the
 # broker: each message is POSTed to the URL, and non-2xx triggers normal
 # retry/backoff/DLQ. Don't also pull these queues via the HTTP API.

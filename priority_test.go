@@ -31,6 +31,108 @@ func newPriorityQueue(t *testing.T) *Queue {
 	return q
 }
 
+// newAgingQueue builds a concurrency=1 queue with priority aging enabled. A
+// one-hour MinWait lets a test mark a message as long-ready by scheduling it in
+// the past while a normally-enqueued message remains unaged, without sleeping.
+func newAgingQueue(t *testing.T, minWait time.Duration) *Queue {
+	t.Helper()
+	q, err := New(Options{
+		Storage:     Memory,
+		Concurrency: 1,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		PriorityAging: PriorityAgingOptions{
+			Enabled: true,
+			MinWait: minWait,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = q.Shutdown(ctx)
+	})
+	return q
+}
+
+// TestPriorityAging_PromotesWaitingLow is the public end-to-end check: a
+// low-priority message that has been ready longer than MinWait is delivered
+// ahead of a higher-priority message that arrived later and has not waited.
+func TestPriorityAging_PromotesWaitingLow(t *testing.T) {
+	q := newAgingQueue(t, time.Hour)
+
+	order := make(chan string, 2)
+	q.Handle("jobs", func(_ context.Context, m Message) error {
+		order <- string(m.Payload)
+		return nil
+	})
+
+	// Pause so both messages are in storage before the dispatcher runs.
+	q.Pause("jobs")
+
+	// "low" has been ready for two hours — beyond the one-hour floor — so it
+	// is promoted despite its lower priority.
+	if err := q.Enqueue("jobs", []byte("low"), WithPriority(Low), Schedule(time.Now().Add(-2*time.Hour))); err != nil {
+		t.Fatalf("Enqueue low: %v", err)
+	}
+	// "high" becomes ready now. With a one-hour floor it is not aged.
+	if err := q.Enqueue("jobs", []byte("high"), WithPriority(High)); err != nil {
+		t.Fatalf("Enqueue high: %v", err)
+	}
+
+	q.Resume("jobs")
+
+	want := []string{"low", "high"}
+	for _, w := range want {
+		select {
+		case got := <-order:
+			if got != w {
+				t.Fatalf("got %q, want %q", got, w)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %q", w)
+		}
+	}
+}
+
+// TestPriorityAging_NotYetAtFloorKeepsPriority verifies the other half of the
+// contract: a low-priority message that has not reached MinWait still loses to
+// a higher-priority message.
+func TestPriorityAging_NotYetAtFloorKeepsPriority(t *testing.T) {
+	q := newAgingQueue(t, time.Hour)
+
+	order := make(chan string, 2)
+	q.Handle("jobs", func(_ context.Context, m Message) error {
+		order <- string(m.Payload)
+		return nil
+	})
+
+	q.Pause("jobs")
+
+	// Ready 30 seconds ago — below the one-hour floor, so not promoted.
+	if err := q.Enqueue("jobs", []byte("low"), WithPriority(Low), Schedule(time.Now().Add(-30*time.Second))); err != nil {
+		t.Fatalf("Enqueue low: %v", err)
+	}
+	if err := q.Enqueue("jobs", []byte("high"), WithPriority(High)); err != nil {
+		t.Fatalf("Enqueue high: %v", err)
+	}
+
+	q.Resume("jobs")
+
+	want := []string{"high", "low"}
+	for _, w := range want {
+		select {
+		case got := <-order:
+			if got != w {
+				t.Fatalf("got %q, want %q", got, w)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %q", w)
+		}
+	}
+}
+
 // TestPriority_DequeueOrder verifies that messages with higher priority are
 // delivered before lower-priority ones, regardless of enqueue order, when all
 // are due at the same time. Ties at the same priority level fall back to FIFO

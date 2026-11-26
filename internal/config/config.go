@@ -33,9 +33,10 @@ import (
 
 // Config is the top-level shoeboxd configuration.
 type Config struct {
-	Server   ServerConfig             `yaml:"server"`
-	Storage  StorageConfig            `yaml:"storage"`
-	Webhooks map[string]WebhookConfig `yaml:"webhooks"`
+	Server        ServerConfig             `yaml:"server"`
+	Storage       StorageConfig            `yaml:"storage"`
+	PriorityAging PriorityAgingConfig      `yaml:"priority_aging"`
+	Webhooks      map[string]WebhookConfig `yaml:"webhooks"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -52,6 +53,12 @@ type StorageConfig struct {
 	Path   string `yaml:"path"`   // SQLite database path
 	DSN    string `yaml:"dsn"`    // Postgres DSN
 	Schema string `yaml:"schema"` // PostgreSQL schema
+}
+
+// PriorityAgingConfig enables starvation prevention for low-priority work.
+type PriorityAgingConfig struct {
+	Enabled *bool         `yaml:"enabled"`  // nil means the default (disabled)
+	MinWait time.Duration `yaml:"min_wait"` // guaranteed wait before promotion
 }
 
 // WebhookConfig declares push delivery for a single queue.
@@ -99,6 +106,9 @@ func (c *Config) validate() error {
 	}
 	if c.Storage.Kind == "postgres" && c.Storage.DSN == "" {
 		return fmt.Errorf("config: storage.dsn is required for postgres")
+	}
+	if c.PriorityAging.Enabled != nil && *c.PriorityAging.Enabled && c.PriorityAging.MinWait <= 0 {
+		return fmt.Errorf("config: priority_aging.min_wait must be positive when enabled")
 	}
 	for name, wh := range c.Webhooks {
 		if wh.URL == "" {

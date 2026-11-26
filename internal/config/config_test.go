@@ -170,6 +170,44 @@ storage:
 	}
 }
 
+func TestLoad_PriorityAging(t *testing.T) {
+	yaml := `
+priority_aging:
+  enabled: true
+  min_wait: 15m
+`
+	c, err := Load(writeTemp(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PriorityAging.Enabled == nil || !*c.PriorityAging.Enabled {
+		t.Fatal("priority_aging.enabled should be true")
+	}
+	if c.PriorityAging.MinWait != 15*time.Minute {
+		t.Fatalf("min_wait = %v, want 15m", c.PriorityAging.MinWait)
+	}
+}
+
+func TestLoad_PriorityAgingDefaultsDisabled(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PriorityAging.Enabled != nil {
+		t.Fatal("priority_aging.enabled should default to unset")
+	}
+}
+
+func TestLoad_PriorityAgingEnabledWithoutMinWait(t *testing.T) {
+	yaml := `
+priority_aging:
+  enabled: true
+`
+	if _, err := Load(writeTemp(t, yaml)); err == nil {
+		t.Fatal("expected error for enabled priority_aging without min_wait")
+	}
+}
+
 func TestLoad_WebhookEmptyURL(t *testing.T) {
 	yaml := `
 webhooks:

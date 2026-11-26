@@ -12,6 +12,96 @@ import (
 	"time"
 )
 
+// Clock supplies the current time. It exists so tests can drive Memory and
+// SQLite from the same controlled clock and assert identical dequeue order.
+// A nil Clock means real time.
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+// Config carries backend construction settings that affect time and dequeue
+// ordering. The zero value means real time and the existing priority order
+// (priority DESC, created_at ASC).
+type Config struct {
+	// Clock is the source of "now" for due checks and priority aging. Nil
+	// uses real time.
+	Clock Clock
+
+	// PriorityAging enables starvation prevention. When false, dequeue
+	// order is the existing priority DESC, created_at ASC.
+	PriorityAging bool
+
+	// PriorityAgingMinWait is how long a due message must have been ready
+	// (ScheduledAt elapsed) before it is promoted ahead of non-aged
+	// messages. Promotion orders aged messages by ready time and then
+	// stable message identity, ignoring priority. Must be positive when
+	// PriorityAging is set.
+	PriorityAgingMinWait time.Duration
+}
+
+func (c Config) clock() Clock {
+	if c.Clock == nil {
+		return realClock{}
+	}
+	return c.Clock
+}
+
+// aging reports whether the config enables priority aging.
+func (c Config) aging() bool {
+	return c.PriorityAging && c.PriorityAgingMinWait > 0
+}
+
+func firstConfig(cfgs []Config) Config {
+	if len(cfgs) > 0 {
+		return cfgs[0]
+	}
+	return Config{}
+}
+
+// aged reports whether msg has been ready for at least minWait at now. A
+// message that is not yet due (ScheduledAt after now) is never aged; the
+// aging clock starts when the message becomes ready.
+func aged(msg Message, now time.Time, minWait time.Duration) bool {
+	return !msg.ScheduledAt.After(now.Add(-minWait))
+}
+
+// dequeueLess is the canonical dequeue order shared by every backend, so the
+// same controlled clock yields the same sequence from Memory and SQLite.
+//
+// With aging disabled it is the historical order: priority DESC, created_at
+// ASC. With aging enabled, due messages that have waited at least the
+// threshold come first (ordered by ready time, then message ID), followed by
+// the rest in priority order. A message that is not yet due is never aged.
+func dequeueLess(a, b Message, now time.Time, cfg Config) bool {
+	if cfg.aging() {
+		aAged := aged(a, now, cfg.PriorityAgingMinWait)
+		bAged := aged(b, now, cfg.PriorityAgingMinWait)
+		if aAged != bAged {
+			return aAged
+		}
+		if aAged {
+			if !a.ScheduledAt.Equal(b.ScheduledAt) {
+				return a.ScheduledAt.Before(b.ScheduledAt)
+			}
+			return a.ID < b.ID
+		}
+	}
+	if a.Priority != b.Priority {
+		return a.Priority > b.Priority
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	if cfg.aging() {
+		return a.ID < b.ID
+	}
+	return false
+}
+
 // Message is the storage-layer view of a queued message. It mirrors the
 // public shoebox.Message so callers don't need to translate between the
 // two; the broker is the only package that does so.

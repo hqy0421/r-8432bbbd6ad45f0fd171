@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,9 @@ import (
 //
 // The driver is modernc.org/sqlite (pure Go, no CGo) per ADR 0004.
 type SQLite struct {
-	db *sql.DB
+	db     *sql.DB
+	clock  Clock
+	config Config
 }
 
 // initSQLiteSchema applies pending schema migrations from the embedded
@@ -146,7 +149,11 @@ func detectSQLiteBaseline(ctx context.Context, db *sql.DB, latest int) (int, err
 // schema migrations, and reclaims any "processing" rows left by a previous
 // crash (transitioning them back to "pending") so that unacked messages are
 // redelivered on restart (E2-S1).
-func NewSQLite(ctx context.Context, path string) (*SQLite, error) {
+//
+// The optional Config supplies a clock and priority-aging settings; without
+// one SQLite uses real time and the historical priority order.
+func NewSQLite(ctx context.Context, path string, cfgs ...Config) (*SQLite, error) {
+	cfg := firstConfig(cfgs)
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("shoebox/sqlite: open %s: %w", path, err)
@@ -174,7 +181,7 @@ func NewSQLite(ctx context.Context, path string) (*SQLite, error) {
 		return nil, fmt.Errorf("shoebox/sqlite: init schema: %w", err)
 	}
 
-	s := &SQLite{db: db}
+	s := &SQLite{db: db, clock: cfg.clock(), config: cfg}
 
 	// Reclaim stale in-flight messages from a previous crash. Every
 	// "processing" row across all queues goes back to "pending" so the
@@ -189,7 +196,7 @@ func NewSQLite(ctx context.Context, path string) (*SQLite, error) {
 }
 
 func (s *SQLite) Enqueue(ctx context.Context, queue string, msg Message) error {
-	return enqueueSQLite(ctx, s.db, queue, msg)
+	return enqueueSQLite(ctx, s.db, queue, msg, s.clock)
 }
 
 // EnqueueBatch inserts all messages in one SQLite transaction.
@@ -209,7 +216,7 @@ func (s *SQLite) EnqueueBatch(ctx context.Context, queue string, messages []Mess
 	}
 	defer func() { _ = stmt.Close() }()
 
-	now := time.Now()
+	now := s.clock.Now()
 	for i, msg := range messages {
 		assignedCreatedAt := msg.CreatedAt.IsZero()
 		if assignedCreatedAt {
@@ -222,7 +229,7 @@ func (s *SQLite) EnqueueBatch(ctx context.Context, queue string, messages []Mess
 				msg.ScheduledAt = msg.CreatedAt
 			}
 		}
-		args, err := sqliteEnqueueArgs(queue, msg)
+		args, err := sqliteEnqueueArgs(queue, msg, s.clock)
 		if err != nil {
 			return err
 		}
@@ -244,16 +251,16 @@ const sqliteInsertSQL = `INSERT INTO shoebox_messages
 	(id, queue, payload, attempts, max_retries, created_at, scheduled_at, priority, dedupe_key, metadata, error, dead_at, status)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-func sqliteEnqueueArgs(queue string, msg Message) ([]any, error) {
+func sqliteEnqueueArgs(queue string, msg Message, clk Clock) ([]any, error) {
 	meta, err := json.Marshal(msg.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("shoebox/sqlite: marshal metadata: %w", err)
 	}
 	if msg.CreatedAt.IsZero() {
-		msg.CreatedAt = time.Now()
+		msg.CreatedAt = clk.Now()
 	}
 	if msg.ScheduledAt.IsZero() {
-		msg.ScheduledAt = time.Now()
+		msg.ScheduledAt = clk.Now()
 	}
 	payload := msg.Payload
 	if payload == nil {
@@ -272,8 +279,8 @@ func sqliteEnqueueArgs(queue string, msg Message) ([]any, error) {
 	}, nil
 }
 
-func enqueueSQLite(ctx context.Context, execer sqliteExecer, queue string, msg Message) error {
-	args, err := sqliteEnqueueArgs(queue, msg)
+func enqueueSQLite(ctx context.Context, execer sqliteExecer, queue string, msg Message, clk Clock) error {
+	args, err := sqliteEnqueueArgs(queue, msg, clk)
 	if err != nil {
 		return err
 	}
@@ -282,6 +289,70 @@ func enqueueSQLite(ctx context.Context, execer sqliteExecer, queue string, msg M
 		return fmt.Errorf("shoebox/sqlite: enqueue: %w", err)
 	}
 	return nil
+}
+
+// dequeueQuery selects due pending messages. Aging mode adds no SQL ORDER BY:
+// the rows are ordered in Go by the same comparator Memory uses, which keeps
+// the two backends' dequeue order identical for a given clock.
+func (s *SQLite) dequeueQuery(ctx context.Context, tx *sql.Tx, queue string, now time.Time, limit int) ([]Message, error) {
+	if s.config.aging() {
+		rows, err := tx.QueryContext(ctx,
+			`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+			 FROM shoebox_messages
+			 WHERE queue = ? AND status = 'pending' AND scheduled_at <= ?`,
+			queue, now.Format(time.RFC3339Nano))
+		if err != nil {
+			return nil, fmt.Errorf("shoebox/sqlite: dequeue query: %w", err)
+		}
+		defer func() { _ = rows.Close() }()
+
+		msgs, err := scanMessages(rows, queue)
+		if err != nil {
+			return nil, fmt.Errorf("shoebox/sqlite: dequeue scan: %w", err)
+		}
+		sort.SliceStable(msgs, func(i, j int) bool {
+			return dequeueLess(msgs[i], msgs[j], now, s.config)
+		})
+		if len(msgs) > limit {
+			msgs = msgs[:limit]
+		}
+		return msgs, nil
+	}
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+		 FROM shoebox_messages
+		 WHERE queue = ? AND status = 'pending' AND scheduled_at <= ?
+		 ORDER BY priority DESC, created_at ASC
+		 LIMIT ?`,
+		queue, now.Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, fmt.Errorf("shoebox/sqlite: dequeue query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	msgs, err := scanMessages(rows, queue)
+	if err != nil {
+		return nil, fmt.Errorf("shoebox/sqlite: dequeue scan: %w", err)
+	}
+	return msgs, nil
+}
+
+// scanMessages reads every row into a Message with its queue set.
+func scanMessages(rows *sql.Rows, queue string) ([]Message, error) {
+	var msgs []Message
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		m.Queue = queue
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return msgs, nil
 }
 
 // Dequeue atomically transitions up to `limit` due messages from 'pending' to
@@ -294,32 +365,9 @@ func (s *SQLite) Dequeue(ctx context.Context, queue string, limit int) ([]Messag
 	}
 	defer func() { _ = tx.Rollback() }() // safe to call after Commit
 
-	now := time.Now().Format(time.RFC3339Nano)
-
-	rows, err := tx.QueryContext(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
-		 FROM shoebox_messages
-		 WHERE queue = ? AND status = 'pending' AND scheduled_at <= ?
-		 ORDER BY priority DESC, created_at ASC
-		 LIMIT ?`,
-		queue, now, limit)
+	msgs, err := s.dequeueQuery(ctx, tx, queue, s.clock.Now(), limit)
 	if err != nil {
-		return nil, fmt.Errorf("shoebox/sqlite: dequeue query: %w", err)
-	}
-
-	var msgs []Message
-	for rows.Next() {
-		m, err := scanMessage(rows)
-		if err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("shoebox/sqlite: dequeue scan: %w", err)
-		}
-		m.Queue = queue
-		msgs = append(msgs, m)
-	}
-	_ = rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("shoebox/sqlite: dequeue rows: %w", err)
+		return nil, err
 	}
 
 	if len(msgs) == 0 {
@@ -433,7 +481,7 @@ func (s *SQLite) Retry(ctx context.Context, queue string, msg Message, _ error) 
 	} else if n != 1 {
 		return ErrEmpty
 	}
-	if err := enqueueSQLite(ctx, tx, queue, msg); err != nil {
+	if err := enqueueSQLite(ctx, tx, queue, msg, s.clock); err != nil {
 		return fmt.Errorf("shoebox/sqlite: retry enqueue: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -455,8 +503,8 @@ func (s *SQLite) DeadLetter(ctx context.Context, queue string, msg Message, hand
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	dead := deadLetterMessage(queue, msg, handlerErr, time.Now().UTC())
-	if err := enqueueSQLite(ctx, tx, dead.Queue, dead); err != nil {
+	dead := deadLetterMessage(queue, msg, handlerErr, s.clock.Now().UTC())
+	if err := enqueueSQLite(ctx, tx, dead.Queue, dead, s.clock); err != nil {
 		return fmt.Errorf("shoebox/sqlite: dead-letter enqueue: %w", err)
 	}
 	result, err := tx.ExecContext(ctx,
@@ -502,7 +550,7 @@ func (s *SQLite) Replay(ctx context.Context, queue, msgID string) error {
 		return fmt.Errorf("shoebox/sqlite: replay query: %w", err)
 	}
 	msg.Queue = queue + ".dlq"
-	msg = replayMessage(queue, msg, time.Now().UTC())
+	msg = replayMessage(queue, msg, s.clock.Now().UTC())
 
 	result, err := tx.ExecContext(ctx,
 		`DELETE FROM shoebox_messages WHERE id = ? AND queue = ? AND status = 'dead'`,
@@ -515,7 +563,7 @@ func (s *SQLite) Replay(ctx context.Context, queue, msgID string) error {
 	} else if n != 1 {
 		return ErrEmpty
 	}
-	if err := enqueueSQLite(ctx, tx, queue, msg); err != nil {
+	if err := enqueueSQLite(ctx, tx, queue, msg, s.clock); err != nil {
 		return fmt.Errorf("shoebox/sqlite: replay enqueue: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -762,7 +810,7 @@ func (s *SQLite) RunSchedule(ctx context.Context, schedule Schedule, now, next t
 
 	result, err := tx.ExecContext(ctx, `UPDATE shoebox_schedules SET next_run_at=?, updated_at=?
 		WHERE id=? AND enabled=1 AND next_run_at=? AND next_run_at <= ?`,
-		sqliteScheduleTime(next), sqliteScheduleTime(time.Now().UTC()), schedule.ID,
+		sqliteScheduleTime(next), sqliteScheduleTime(s.clock.Now().UTC()), schedule.ID,
 		sqliteScheduleTime(schedule.NextRunAt), sqliteScheduleTime(now))
 	if err != nil {
 		return false, fmt.Errorf("shoebox/sqlite: schedule update: %w", err)
@@ -772,7 +820,7 @@ func (s *SQLite) RunSchedule(ctx context.Context, schedule Schedule, now, next t
 	} else if n != 1 {
 		return false, nil
 	}
-	if err := enqueueSQLite(ctx, tx, schedule.Queue, periodicMessage(schedule, now)); err != nil {
+	if err := enqueueSQLite(ctx, tx, schedule.Queue, periodicMessage(schedule, now), s.clock); err != nil {
 		return false, fmt.Errorf("shoebox/sqlite: schedule enqueue: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

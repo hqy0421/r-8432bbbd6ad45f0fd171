@@ -53,6 +53,9 @@ func New(opts Options) (*Queue, error) {
 	if opts.Dedupe.Policy == DedupePolicyDurable && opts.Storage != Postgres {
 		return nil, fmt.Errorf("shoebox: durable dedupe requires Postgres storage")
 	}
+	if opts.PriorityAging.Enabled && opts.PriorityAging.MinWait <= 0 {
+		return nil, fmt.Errorf("shoebox: priority aging requires a positive MinWait")
+	}
 
 	store, err := buildStorage(context.Background(), opts)
 	if err != nil {
@@ -82,19 +85,23 @@ func New(opts Options) (*Queue, error) {
 
 // buildStorage returns the Storage implementation for the requested kind.
 func buildStorage(ctx context.Context, opts Options) (storage.Storage, error) {
+	cfg := storage.Config{
+		PriorityAging:        opts.PriorityAging.Enabled,
+		PriorityAgingMinWait: opts.PriorityAging.MinWait,
+	}
 	switch opts.Storage {
 	case Memory:
-		return storage.NewMemory(), nil
+		return storage.NewMemory(cfg), nil
 	case SQLite:
 		if opts.Path == "" {
 			return nil, fmt.Errorf("shoebox: SQLite storage requires Options.Path")
 		}
-		return storage.NewSQLite(ctx, opts.Path)
+		return storage.NewSQLite(ctx, opts.Path, cfg)
 	case Postgres:
 		if opts.DSN == "" {
 			return nil, fmt.Errorf("shoebox: Postgres storage requires Options.DSN")
 		}
-		return storage.NewPostgres(ctx, opts.DSN, opts.Schema)
+		return storage.NewPostgresWithConfig(ctx, opts.DSN, cfg, opts.Schema)
 	default:
 		return nil, fmt.Errorf("shoebox: unknown storage kind %d", opts.Storage)
 	}

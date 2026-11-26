@@ -27,6 +27,8 @@ import (
 type Postgres struct {
 	pool   *pgxpool.Pool
 	schema string
+	clock  Clock
+	config Config
 }
 
 // NewPostgres opens a connection pool to the Postgres database at dsn,
@@ -34,6 +36,12 @@ type Postgres struct {
 // previous crash (E2-S1). The optional schema defaults to "public". The dsn
 // should be a standard Postgres connection string.
 func NewPostgres(ctx context.Context, dsn string, schemas ...string) (*Postgres, error) {
+	return NewPostgresWithConfig(ctx, dsn, Config{}, schemas...)
+}
+
+// NewPostgresWithConfig is NewPostgres plus the clock and priority-aging
+// settings. The zero Config uses real time and the historical priority order.
+func NewPostgresWithConfig(ctx context.Context, dsn string, cfg Config, schemas ...string) (*Postgres, error) {
 	schema := "public"
 	if len(schemas) > 0 && schemas[0] != "" {
 		schema = schemas[0]
@@ -112,7 +120,7 @@ func NewPostgres(ctx context.Context, dsn string, schemas ...string) (*Postgres,
 		return nil, fmt.Errorf("shoebox/postgres: reclaim: %w", err)
 	}
 
-	return &Postgres{pool: pool, schema: schema}, nil
+	return &Postgres{pool: pool, schema: schema, clock: cfg.clock(), config: cfg}, nil
 }
 
 // quotePostgresIdentifier safely quotes a configured schema name. Schema
@@ -276,7 +284,7 @@ func appliedPostgresVersion(ctx context.Context, tx pgx.Tx, latest int) (int, er
 	return baseline, nil
 }
 func (p *Postgres) Enqueue(ctx context.Context, queue string, msg Message) error {
-	return enqueuePostgres(ctx, p.pool.Exec, queue, msg)
+	return enqueuePostgres(ctx, p.pool.Exec, queue, msg, p.clock)
 }
 
 // EnqueueBatch inserts all messages in one PostgreSQL transaction.
@@ -290,7 +298,7 @@ func (p *Postgres) EnqueueBatch(ctx context.Context, queue string, messages []Me
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	now := time.Now()
+	now := p.clock.Now()
 	batch := &pgx.Batch{}
 	for i, msg := range messages {
 		assignedCreatedAt := msg.CreatedAt.IsZero()
@@ -304,7 +312,7 @@ func (p *Postgres) EnqueueBatch(ctx context.Context, queue string, messages []Me
 				msg.ScheduledAt = msg.CreatedAt
 			}
 		}
-		args, err := postgresEnqueueArgs(queue, msg)
+		args, err := postgresEnqueueArgs(queue, msg, p.clock)
 		if err != nil {
 			return err
 		}
@@ -331,8 +339,9 @@ func enqueuePostgres(
 	exec func(context.Context, string, ...any) (pgconn.CommandTag, error),
 	queue string,
 	msg Message,
+	clk Clock,
 ) error {
-	_, err := enqueuePostgresRow(ctx, exec, queue, msg)
+	_, err := enqueuePostgresRow(ctx, exec, queue, msg, clk)
 	return err
 }
 
@@ -341,8 +350,9 @@ func enqueuePostgresAtomic(
 	exec func(context.Context, string, ...any) (pgconn.CommandTag, error),
 	queue string,
 	msg Message,
+	clk Clock,
 ) error {
-	inserted, err := enqueuePostgresRow(ctx, exec, queue, msg)
+	inserted, err := enqueuePostgresRow(ctx, exec, queue, msg, clk)
 	if err != nil {
 		return err
 	}
@@ -372,8 +382,9 @@ func enqueuePostgresRow(
 	exec func(context.Context, string, ...any) (pgconn.CommandTag, error),
 	queue string,
 	msg Message,
+	clk Clock,
 ) (bool, error) {
-	args, err := postgresEnqueueArgs(queue, msg)
+	args, err := postgresEnqueueArgs(queue, msg, clk)
 	if err != nil {
 		return false, err
 	}
@@ -384,16 +395,16 @@ func enqueuePostgresRow(
 	return tag.RowsAffected() == 1, nil
 }
 
-func postgresEnqueueArgs(queue string, msg Message) ([]any, error) {
+func postgresEnqueueArgs(queue string, msg Message, clk Clock) ([]any, error) {
 	meta, err := json.Marshal(msg.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("shoebox/postgres: marshal metadata: %w", err)
 	}
 	if msg.CreatedAt.IsZero() {
-		msg.CreatedAt = time.Now()
+		msg.CreatedAt = clk.Now()
 	}
 	if msg.ScheduledAt.IsZero() {
-		msg.ScheduledAt = time.Now()
+		msg.ScheduledAt = clk.Now()
 	}
 	payload := msg.Payload
 	if payload == nil {
@@ -413,10 +424,19 @@ func postgresEnqueueArgs(queue string, msg Message) ([]any, error) {
 	}, nil
 }
 
+const postgresDequeueSelect = `SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+	 FROM shoebox_messages
+	 WHERE queue = $1 AND status = 'pending'`
+
 // Dequeue uses SELECT … FOR UPDATE SKIP LOCKED to atomically claim up to
 // `limit` due messages. This allows multiple consumer processes to pull from
 // the same queue without double-delivery (E2-S4): each consumer locks its
 // rows, so no two consumers ever see the same message.
+//
+// With priority aging enabled, messages that became ready at least
+// PriorityAgingMinWait ago are claimed first, ordered by ready time and then
+// id, ahead of later-arriving higher-priority work. Messages whose scheduled
+// time has not arrived are never due and so never promoted.
 func (p *Postgres) Dequeue(ctx context.Context, queue string, limit int) ([]Message, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -424,14 +444,29 @@ func (p *Postgres) Dequeue(ctx context.Context, queue string, limit int) ([]Mess
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	rows, err := tx.Query(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
-		 FROM shoebox_messages
-		 WHERE queue = $1 AND status = 'pending' AND scheduled_at <= now()
-		 ORDER BY priority DESC, created_at ASC
-		 LIMIT $2
-		 FOR UPDATE SKIP LOCKED`,
-		queue, limit)
+	var rows pgx.Rows
+	if p.config.aging() {
+		now := p.clock.Now()
+		cutoff := now.Add(-p.config.PriorityAgingMinWait)
+		rows, err = tx.Query(ctx, postgresDequeueSelect+`
+			 AND scheduled_at <= $2
+			 ORDER BY (scheduled_at <= $3) DESC,
+			          CASE WHEN scheduled_at <= $3 THEN scheduled_at END ASC,
+			          CASE WHEN scheduled_at <= $3 THEN id END ASC,
+			          CASE WHEN scheduled_at > $3 THEN priority END DESC,
+			          CASE WHEN scheduled_at > $3 THEN created_at END ASC,
+			          CASE WHEN scheduled_at > $3 THEN id END ASC
+			 LIMIT $4
+			 FOR UPDATE SKIP LOCKED`,
+			queue, now, cutoff, limit)
+	} else {
+		rows, err = tx.Query(ctx, postgresDequeueSelect+`
+			 AND scheduled_at <= now()
+			 ORDER BY priority DESC, created_at ASC
+			 LIMIT $2
+			 FOR UPDATE SKIP LOCKED`,
+			queue, limit)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("shoebox/postgres: dequeue query: %w", err)
 	}
@@ -544,7 +579,7 @@ func (p *Postgres) Retry(ctx context.Context, queue string, msg Message, _ error
 	if tag.RowsAffected() != 1 {
 		return ErrEmpty
 	}
-	if err := enqueuePostgresAtomic(ctx, tx.Exec, queue, msg); err != nil {
+	if err := enqueuePostgresAtomic(ctx, tx.Exec, queue, msg, p.clock); err != nil {
 		return fmt.Errorf("shoebox/postgres: retry enqueue: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
@@ -566,8 +601,8 @@ func (p *Postgres) DeadLetter(ctx context.Context, queue string, msg Message, ha
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	dead := deadLetterMessage(queue, msg, handlerErr, time.Now().UTC())
-	if err := enqueuePostgresAtomic(ctx, tx.Exec, dead.Queue, dead); err != nil {
+	dead := deadLetterMessage(queue, msg, handlerErr, p.clock.Now().UTC())
+	if err := enqueuePostgresAtomic(ctx, tx.Exec, dead.Queue, dead, p.clock); err != nil {
 		return fmt.Errorf("shoebox/postgres: dead-letter enqueue: %w", err)
 	}
 	tag, err := tx.Exec(ctx,
@@ -612,7 +647,7 @@ func (p *Postgres) Replay(ctx context.Context, queue, msgID string) error {
 		return fmt.Errorf("shoebox/postgres: replay query: %w", err)
 	}
 	msg.Queue = queue + ".dlq"
-	msg = replayMessage(queue, msg, time.Now().UTC())
+	msg = replayMessage(queue, msg, p.clock.Now().UTC())
 
 	tag, err := tx.Exec(ctx,
 		`DELETE FROM shoebox_messages WHERE id = $1 AND queue = $2 AND status = 'dead'`,
@@ -623,7 +658,7 @@ func (p *Postgres) Replay(ctx context.Context, queue, msgID string) error {
 	if tag.RowsAffected() != 1 {
 		return ErrEmpty
 	}
-	if err := enqueuePostgresAtomic(ctx, tx.Exec, queue, msg); err != nil {
+	if err := enqueuePostgresAtomic(ctx, tx.Exec, queue, msg, p.clock); err != nil {
 		return fmt.Errorf("shoebox/postgres: replay enqueue: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
@@ -867,7 +902,7 @@ func (p *Postgres) RunSchedule(ctx context.Context, schedule Schedule, now, next
 	if tag.RowsAffected() != 1 {
 		return false, nil
 	}
-	if err := enqueuePostgresAtomic(ctx, tx.Exec, schedule.Queue, periodicMessage(schedule, now)); err != nil {
+	if err := enqueuePostgresAtomic(ctx, tx.Exec, schedule.Queue, periodicMessage(schedule, now), p.clock); err != nil {
 		return false, fmt.Errorf("shoebox/postgres: schedule enqueue: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -21,6 +21,7 @@ func TestNewValidation(t *testing.T) {
 		{name: "postgres requires dsn", opts: Options{Storage: Postgres}, want: "requires Options.DSN"},
 		{name: "unknown storage", opts: Options{Storage: StorageKind(99)}, want: "unknown storage kind"},
 		{name: "unknown dedupe policy", opts: Options{Storage: Memory, Dedupe: DedupeOptions{Policy: "invalid"}}, want: "unsupported dedupe policy"},
+		{name: "priority aging needs min wait", opts: Options{Storage: Memory, PriorityAging: PriorityAgingOptions{Enabled: true}}, want: "priority aging requires a positive MinWait"},
 	}
 
 	for _, tc := range tests {

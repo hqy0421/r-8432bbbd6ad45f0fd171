@@ -322,6 +322,40 @@ q.Enqueue("emails", payload) // default: Low
 The available levels are `Low` (0), `Normal` (1), and `High` (2). Backends
 implement this as `ORDER BY priority DESC, created_at ASC`.
 
+#### Priority aging
+
+Strict priority can starve low-priority work when a queue is continuously fed
+higher-priority messages. Priority aging bounds that wait: once a due message
+has been ready for `MinWait`, it is delivered ahead of any message that has
+not waited as long, regardless of priority.
+
+```go
+q, _ := shoebox.New(shoebox.Options{
+    Storage: shoebox.Memory,
+    PriorityAging: shoebox.PriorityAgingOptions{
+        Enabled: true,
+        MinWait: 10 * time.Minute,
+    },
+})
+```
+
+Behavior:
+
+- Below `MinWait`, dequeue order is unchanged: higher priority first, then
+  FIFO by `created_at`.
+- At `MinWait`, ready messages are promoted ahead of later, higher-priority
+  arrivals. Among promoted candidates, the one ready longest goes first; ties
+  break by message ID, so the order is stable.
+- A message whose `ScheduledAt` (its ready time) has not arrived never
+  participates. Aging is measured from when the message becomes ready, not
+  from when it was enqueued.
+- Aging is off by default; the zero value preserves the existing
+  priority-first order.
+
+Memory, SQLite, and PostgreSQL all apply the same rule; Memory and SQLite
+share one comparator (and a controllable clock) so they return an identical
+order for the same messages.
+
 ### Deduplication
 
 `DedupeKey` suppresses repeated enqueues for the same queue and key during the

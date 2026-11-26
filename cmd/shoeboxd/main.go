@@ -78,6 +78,12 @@ func main() {
 
 	// --- build engine ---
 	opts := shoebox.Options{Logger: logger}
+	if cfg.PriorityAging.Enabled != nil && *cfg.PriorityAging.Enabled {
+		opts.PriorityAging = shoebox.PriorityAgingOptions{
+			Enabled: true,
+			MinWait: cfg.PriorityAging.MinWait,
+		}
+	}
 	switch cfg.Storage.Kind {
 	case "memory":
 		opts.Storage = shoebox.Memory

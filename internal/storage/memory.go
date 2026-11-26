@@ -21,16 +21,23 @@ type Memory struct {
 	inflight  map[string]map[string]struct{}
 	dirty     map[string]bool
 	schedules map[string]Schedule
+	clock     Clock
+	config    Config
 }
 
-// NewMemory returns an empty in-memory storage backend.
-func NewMemory() *Memory {
+// NewMemory returns an empty in-memory storage backend. The optional Config
+// supplies a clock and priority-aging settings; without one Memory uses real
+// time and the historical priority order.
+func NewMemory(cfgs ...Config) *Memory {
+	cfg := firstConfig(cfgs)
 	return &Memory{
 		queues:    make(map[string][]Message),
 		counters:  make(map[string]*QueueStats),
 		inflight:  make(map[string]map[string]struct{}),
 		dirty:     make(map[string]bool),
 		schedules: make(map[string]Schedule),
+		clock:     cfg.clock(),
+		config:    cfg,
 	}
 }
 
@@ -47,8 +54,9 @@ func (m *Memory) statsFor(queue string) *QueueStats {
 func (m *Memory) Enqueue(_ context.Context, queue string, msg Message) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.clock.Now()
 	if msg.CreatedAt.IsZero() {
-		msg.CreatedAt = time.Now()
+		msg.CreatedAt = now
 	}
 	if msg.ScheduledAt.IsZero() {
 		msg.ScheduledAt = msg.CreatedAt
@@ -65,7 +73,7 @@ func (m *Memory) EnqueueBatch(_ context.Context, queue string, messages []Messag
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := time.Now()
+	now := m.clock.Now()
 	for i, msg := range messages {
 		assignedCreatedAt := msg.CreatedAt.IsZero()
 		if assignedCreatedAt {
@@ -100,18 +108,18 @@ func (m *Memory) Dequeue(_ context.Context, queue string, limit int) ([]Message,
 		return nil, ErrEmpty
 	}
 
-	now := time.Now()
+	now := m.clock.Now()
 
-	// Sort pending by (priority DESC, created_at ASC) so the scan picks
-	// the highest-priority due message first. Only re-sort when the queue
-	// has been modified since the last Dequeue — the dispatcher polls every
-	// 250ms, and re-sorting an unchanged slice is wasted work.
-	if m.dirty[queue] {
+	// Sort pending into the canonical dequeue order (see dequeueLess): the
+	// historical priority DESC, created_at ASC, or — when priority aging is
+	// enabled — ready-and-aged messages first. With aging off we re-sort
+	// only when the queue changed since the last Dequeue; the dispatcher
+	// polls every 250ms, and re-sorting an unchanged slice is wasted work.
+	// With aging on the order also depends on the current time (a message
+	// crosses the threshold without any write), so we always re-sort.
+	if m.dirty[queue] || m.config.aging() {
 		sort.SliceStable(pending, func(i, j int) bool {
-			if pending[i].Priority != pending[j].Priority {
-				return pending[i].Priority > pending[j].Priority
-			}
-			return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+			return dequeueLess(pending[i], pending[j], now, m.config)
 		})
 		delete(m.dirty, queue)
 	}
@@ -199,7 +207,7 @@ func (m *Memory) DeadLetter(_ context.Context, queue string, msg Message, err er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.inflight[queue], msg.ID)
-	dead := deadLetterMessage(queue, msg, err, time.Now().UTC())
+	dead := deadLetterMessage(queue, msg, err, m.clock.Now().UTC())
 	m.queues[dead.Queue] = append(m.queues[dead.Queue], dead)
 	m.dirty[dead.Queue] = true
 	m.statsFor(queue).Dead++
@@ -217,7 +225,7 @@ func (m *Memory) Replay(_ context.Context, queue, msgID string) error {
 		if msg.ID != msgID {
 			continue
 		}
-		m.queues[queue] = append(m.queues[queue], replayMessage(queue, msg, time.Now().UTC()))
+		m.queues[queue] = append(m.queues[queue], replayMessage(queue, msg, m.clock.Now().UTC()))
 		m.dirty[queue] = true
 		m.statsFor(dlq).Processed++
 		m.queues[dlq] = append(pending[:i], pending[i+1:]...)
@@ -327,7 +335,7 @@ func (m *Memory) RunSchedule(_ context.Context, schedule Schedule, now, next tim
 	m.queues[schedule.Queue] = append(m.queues[schedule.Queue], periodicMessage(schedule, now))
 	m.dirty[schedule.Queue] = true
 	current.NextRunAt = next
-	current.UpdatedAt = time.Now().UTC()
+	current.UpdatedAt = m.clock.Now().UTC()
 	m.schedules[schedule.ID] = current
 	return true, nil
 }

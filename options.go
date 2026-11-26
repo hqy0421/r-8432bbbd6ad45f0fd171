@@ -53,6 +53,26 @@ type Options struct {
 	// Batching enables broker acknowledgement batching. EnqueueBatch always
 	// uses transactional storage batching explicitly.
 	Batching BatchOptions
+
+	// PriorityAging prevents low-priority starvation. When enabled, a due
+	// message that has been ready for at least MinWait is delivered ahead
+	// of higher-priority messages that have not waited as long. Disabled
+	// keeps the existing priority DESC, created_at ASC order.
+	PriorityAging PriorityAgingOptions
+}
+
+// PriorityAgingOptions configures starvation prevention for low-priority
+// messages.
+type PriorityAgingOptions struct {
+	// Enabled turns on priority aging.
+	Enabled bool
+
+	// MinWait is the guaranteed wait before a ready message is promoted
+	// ahead of later, higher-priority messages. It is measured from the
+	// time the message became ready (ScheduledAt), so messages whose
+	// scheduled time has not arrived never participate. Must be positive
+	// when Enabled is set.
+	MinWait time.Duration
 }
 
 // BatchOptions configures optional broker acknowledgement batching.
